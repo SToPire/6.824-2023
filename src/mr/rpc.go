@@ -11,7 +11,6 @@ import (
 	"strconv"
 )
 
-// Add your RPC definitions here.
 type RegisterRequest struct {
 }
 
@@ -25,14 +24,14 @@ type MapGetTaskRequest struct {
 }
 
 type MapGetTaskReply struct {
-	Filename string
-	/* If all the mapper has done */
-	Done bool
+	FileId      int
+	Filename    string
+	AllFileDone bool
 }
 
 type MapTaskDoneRequest struct {
-	Id       int
-	Filename string
+	Id     int
+	FileId int
 }
 
 type MapTaskDoneReply struct {
@@ -44,8 +43,8 @@ type ReduceGetTaskRequest struct {
 
 type ReduceGetTaskReply struct {
 	ReducerId      int
-	Nworker        int
 	AllReducerDone bool
+	NFiles         int
 }
 
 type ReduceTaskDoneRequest struct {
@@ -57,6 +56,7 @@ type ReduceTaskDoneReply struct {
 }
 
 type GraceExitRequest struct {
+	Id int
 }
 
 type GraceExitReply struct {

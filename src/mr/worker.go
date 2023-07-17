@@ -35,65 +35,66 @@ func ihash(key string) int {
 }
 
 func MapPhase(mapf func(string, string) []KeyValue, worker_id int, n_reducer int) {
-	intermediate_files := []*os.File{}
-	encoders := []*json.Encoder{}
-	for i := 0; i < n_reducer; i++ {
-		filename := fmt.Sprintf("mr-%d-%d", worker_id, i)
-		file, err := os.OpenFile(filename, os.O_CREATE|os.O_RDWR, 0644)
-		if err != nil {
-			log.Fatalf("cannot open %v", filename)
-		}
-		intermediate_files = append(intermediate_files, file)
-		encoders = append(encoders, json.NewEncoder(file))
-	}
-	intermediate_file_open := true
-
 	for {
 		map_get_task_req := MapGetTaskRequest{Id: worker_id}
 		map_get_task_reply := MapGetTaskReply{}
 		if !call("Coordinator.MapGetTask", &map_get_task_req, &map_get_task_reply) {
-			fmt.Printf("MapGetTask call failed!\n")
+			log.Fatalf("MapGetTask call failed!\n")
 		}
 
-		if map_get_task_reply.Filename == "" {
-			if intermediate_file_open {
-				for _, file := range intermediate_files {
-					file.Close()
-				}
-				intermediate_file_open = false
-			}
+		fileid := map_get_task_reply.FileId
+		filename := map_get_task_reply.Filename
 
-			if map_get_task_reply.Done {
+		if filename == "" {
+			if map_get_task_reply.AllFileDone {
 				break
 			}
 			time.Sleep(time.Duration(100) * time.Millisecond)
-		} else {
-			file, err := os.Open(map_get_task_reply.Filename)
+			continue
+		}
+
+		intermediate_files := []*os.File{}
+		encoders := []*json.Encoder{}
+		for i := 0; i < n_reducer; i++ {
+			file, err := ioutil.TempFile("./", "tmp-5840-map-")
 			if err != nil {
-				log.Fatalf("cannot open %v", map_get_task_reply.Filename)
+				log.Fatalf("cannot create tempfile")
 			}
-			content, err := ioutil.ReadAll(file)
+			intermediate_files = append(intermediate_files, file)
+			encoders = append(encoders, json.NewEncoder(file))
+		}
+
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("cannot open %v", filename)
+		}
+		content, err := ioutil.ReadAll(file)
+		if err != nil {
+			log.Fatalf("cannot read %v", filename)
+		}
+		file.Close()
+
+		kva := mapf(filename, string(content))
+
+		for _, kv := range kva {
+			idx := ihash(kv.Key) % n_reducer
+			err := encoders[idx].Encode(&kv)
 			if err != nil {
-				log.Fatalf("cannot read %v", map_get_task_reply.Filename)
-			}
-			file.Close()
-
-			kva := mapf(map_get_task_reply.Filename, string(content))
-
-			for _, kv := range kva {
-				idx := ihash(kv.Key) % n_reducer
-				err := encoders[idx].Encode(&kv)
-				if err != nil {
-					log.Fatalf("cannot encode %v", kv)
-				}
-			}
-
-			map_done_req := MapTaskDoneRequest{Id: worker_id, Filename: map_get_task_reply.Filename}
-			map_done_reply := MapTaskDoneReply{}
-			if !call("Coordinator.MapTaskDone", &map_done_req, &map_done_reply) {
-				fmt.Printf("MapTaskDone call failed!\n")
+				log.Fatalf("cannot encode %v to tempfile %v", kv, intermediate_files[idx].Name())
 			}
 		}
+
+		for i := 0; i < len(intermediate_files); i++ {
+			os.Rename(intermediate_files[i].Name(), fmt.Sprintf("mr-%d-%d", fileid, i))
+			intermediate_files[i].Close()
+		}
+
+		map_done_req := MapTaskDoneRequest{Id: worker_id, FileId: fileid}
+		map_done_reply := MapTaskDoneReply{}
+		if !call("Coordinator.MapTaskDone", &map_done_req, &map_done_reply) {
+			log.Fatalf("MapTaskDone call failed!\n")
+		}
+
 	}
 }
 
@@ -102,7 +103,7 @@ func ReducePhase(reducef func(string, []string) string, worker_id int) {
 		reduce_get_task_req := ReduceGetTaskRequest{Id: worker_id}
 		reduce_get_task_reply := ReduceGetTaskReply{}
 		if !call("Coordinator.ReduceGetTask", &reduce_get_task_req, &reduce_get_task_reply) {
-			fmt.Printf("ReduceGetTask call failed!\n")
+			log.Fatalf("ReduceGetTask call failed!\n")
 		}
 
 		if reduce_get_task_reply.ReducerId == -1 {
@@ -117,7 +118,7 @@ func ReducePhase(reducef func(string, []string) string, worker_id int) {
 		reducer_id := reduce_get_task_reply.ReducerId
 		kva := []KeyValue{}
 
-		for i := 0; i < reduce_get_task_reply.Nworker; i++ {
+		for i := 0; i < reduce_get_task_reply.NFiles; i++ {
 			filename := fmt.Sprintf("mr-%d-%d", i, reducer_id)
 			file, err := os.Open(filename)
 			if err != nil {
@@ -136,8 +137,7 @@ func ReducePhase(reducef func(string, []string) string, worker_id int) {
 
 		sort.Sort(ByKey(kva))
 
-		oname := fmt.Sprintf("mr-out-%d", reducer_id)
-		ofile, _ := os.Create(oname)
+		ofile, _ := ioutil.TempFile("./", "tmp-5840-reduce-")
 
 		i := 0
 		for i < len(kva) {
@@ -157,12 +157,13 @@ func ReducePhase(reducef func(string, []string) string, worker_id int) {
 			i = j
 		}
 
+		os.Rename(ofile.Name(), fmt.Sprintf("mr-out-%d", reducer_id))
 		ofile.Close()
 
 		reduce_done_req := ReduceTaskDoneRequest{Id: worker_id, ReducerId: reducer_id}
 		reduce_done_reply := ReduceTaskDoneReply{}
 		if !call("Coordinator.ReduceTaskDone", &reduce_done_req, &reduce_done_reply) {
-			fmt.Printf("ReduceTaskDone call failed!\n")
+			log.Fatalf("ReduceTaskDone call failed!\n")
 		}
 	}
 }
@@ -174,7 +175,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	register_req := RegisterRequest{}
 	register_reply := RegisterReply{}
 	if !call("Coordinator.Register", &register_req, &register_reply) {
-		fmt.Printf("Register call failed!\n")
+		log.Fatalf("Register call failed!\n")
 	}
 	worker_id := register_reply.Id
 	n_reducer := register_reply.Nreducer
@@ -182,10 +183,10 @@ func Worker(mapf func(string, string) []KeyValue,
 	MapPhase(mapf, worker_id, n_reducer)
 	ReducePhase(reducef, worker_id)
 
-	grace_exit_request := GraceExitRequest{}
+	grace_exit_request := GraceExitRequest{Id: worker_id}
 	grace_exit_reply := GraceExitReply{}
 	if !call("Coordinator.GraceExit", &grace_exit_request, &grace_exit_reply) {
-		fmt.Printf("GraceExit call failed!\n")
+		log.Fatalf("GraceExit call failed!\n")
 	}
 }
 
