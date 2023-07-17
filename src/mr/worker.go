@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"time"
 )
 
@@ -17,6 +18,14 @@ type KeyValue struct {
 	Value string
 }
 
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
 func ihash(key string) int {
@@ -25,19 +34,7 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-// main/mrworker.go calls this function.
-func Worker(mapf func(string, string) []KeyValue,
-	reducef func(string, []string) string) {
-
-	register_req := RegisterRequest{}
-	register_reply := RegisterReply{}
-	ok := call("Coordinator.Register", &register_req, &register_reply)
-	if !ok {
-		fmt.Printf("Register call failed!\n")
-	}
-	worker_id := register_reply.Id
-	n_reducer := register_reply.Nreducer
-
+func MapPhase(mapf func(string, string) []KeyValue, worker_id int, n_reducer int) {
 	intermediate_files := []*os.File{}
 	encoders := []*json.Encoder{}
 	for i := 0; i < n_reducer; i++ {
@@ -49,15 +46,23 @@ func Worker(mapf func(string, string) []KeyValue,
 		intermediate_files = append(intermediate_files, file)
 		encoders = append(encoders, json.NewEncoder(file))
 	}
+	intermediate_file_open := true
 
 	for {
 		map_get_task_req := MapGetTaskRequest{Id: worker_id}
 		map_get_task_reply := MapGetTaskReply{}
-		if !call("Coordinator.MapTaskAssign", &map_get_task_req, &map_get_task_reply) {
-			fmt.Printf("MapTaskAssign call failed!\n")
+		if !call("Coordinator.MapGetTask", &map_get_task_req, &map_get_task_reply) {
+			fmt.Printf("MapGetTask call failed!\n")
 		}
 
 		if map_get_task_reply.Filename == "" {
+			if intermediate_file_open {
+				for _, file := range intermediate_files {
+					file.Close()
+				}
+				intermediate_file_open = false
+			}
+
 			if map_get_task_reply.Done {
 				break
 			}
@@ -90,11 +95,98 @@ func Worker(mapf func(string, string) []KeyValue,
 			}
 		}
 	}
+}
 
-	for _, file := range intermediate_files {
-		file.Close()
+func ReducePhase(reducef func(string, []string) string, worker_id int) {
+	for {
+		reduce_get_task_req := ReduceGetTaskRequest{Id: worker_id}
+		reduce_get_task_reply := ReduceGetTaskReply{}
+		if !call("Coordinator.ReduceGetTask", &reduce_get_task_req, &reduce_get_task_reply) {
+			fmt.Printf("ReduceGetTask call failed!\n")
+		}
+
+		if reduce_get_task_reply.ReducerId == -1 {
+			if reduce_get_task_reply.AllReducerDone {
+				break
+			}
+
+			time.Sleep(time.Duration(100) * time.Millisecond)
+			continue
+		}
+
+		reducer_id := reduce_get_task_reply.ReducerId
+		kva := []KeyValue{}
+
+		for i := 0; i < reduce_get_task_reply.Nworker; i++ {
+			filename := fmt.Sprintf("mr-%d-%d", i, reducer_id)
+			file, err := os.Open(filename)
+			if err != nil {
+				log.Fatalf("cannot open %v", filename)
+			}
+			dec := json.NewDecoder(file)
+			for {
+				var kv KeyValue
+				if err := dec.Decode(&kv); err != nil {
+					break
+				}
+				kva = append(kva, kv)
+			}
+			file.Close()
+		}
+
+		sort.Sort(ByKey(kva))
+
+		oname := fmt.Sprintf("mr-out-%d", reducer_id)
+		ofile, _ := os.Create(oname)
+
+		i := 0
+		for i < len(kva) {
+			j := i + 1
+			for j < len(kva) && kva[i].Key == kva[j].Key {
+				j++
+			}
+			values := []string{}
+			for k := i; k < j; k++ {
+				values = append(values, kva[k].Value)
+			}
+
+			output := reducef(kva[i].Key, values)
+
+			fmt.Fprintf(ofile, "%v %v\n", kva[i].Key, output)
+
+			i = j
+		}
+
+		ofile.Close()
+
+		reduce_done_req := ReduceTaskDoneRequest{Id: worker_id, ReducerId: reducer_id}
+		reduce_done_reply := ReduceTaskDoneReply{}
+		if !call("Coordinator.ReduceTaskDone", &reduce_done_req, &reduce_done_reply) {
+			fmt.Printf("ReduceTaskDone call failed!\n")
+		}
 	}
+}
 
+// main/mrworker.go calls this function.
+func Worker(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string) {
+
+	register_req := RegisterRequest{}
+	register_reply := RegisterReply{}
+	if !call("Coordinator.Register", &register_req, &register_reply) {
+		fmt.Printf("Register call failed!\n")
+	}
+	worker_id := register_reply.Id
+	n_reducer := register_reply.Nreducer
+
+	MapPhase(mapf, worker_id, n_reducer)
+	ReducePhase(reducef, worker_id)
+
+	grace_exit_request := GraceExitRequest{}
+	grace_exit_reply := GraceExitReply{}
+	if !call("Coordinator.GraceExit", &grace_exit_request, &grace_exit_reply) {
+		fmt.Printf("GraceExit call failed!\n")
+	}
 }
 
 // send an RPC request to the coordinator, wait for the response.

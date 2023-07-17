@@ -38,6 +38,30 @@ type MapTaskDoneRequest struct {
 type MapTaskDoneReply struct {
 }
 
+type ReduceGetTaskRequest struct {
+	Id int
+}
+
+type ReduceGetTaskReply struct {
+	ReducerId      int
+	Nworker        int
+	AllReducerDone bool
+}
+
+type ReduceTaskDoneRequest struct {
+	Id        int
+	ReducerId int
+}
+
+type ReduceTaskDoneReply struct {
+}
+
+type GraceExitRequest struct {
+}
+
+type GraceExitReply struct {
+}
+
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
 // Can't use the current directory since

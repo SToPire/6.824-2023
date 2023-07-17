@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"container/list"
 	"log"
 	"net"
 	"net/http"
@@ -10,67 +11,72 @@ import (
 )
 
 type Coordinator struct {
-	nReduce int
-	files   []string
-	nFiles  int
-
 	mutex sync.Mutex
 
+	files       []string
+	nWorker     int
+	nWorkerExit int
+
 	/* --- Metadata for map phase --- */
-	curFile      int   // Next file to be assigned
-	pendingFiles []int // -2: not assigned, -1: done, >=0: assigned
+	nFiles       int
+	pendingFiles *list.List
+	FileStatus   []int // -2: not assigned, -1: done, >=0: assigned
 
 	/* --- Metadata for reduce phase --- */
-
-	/* --- Metadata for workers --- */
-	nWorkers int
+	nReducer        int
+	pendingReducers *list.List
+	ReducerStatus   []int // -2: not assigned, -1: done, >=0: assigned
+	nReducerDone    int
 }
 
 func (c *Coordinator) Register(args *RegisterRequest, reply *RegisterReply) error {
 	c.mutex.Lock()
+	defer c.mutex.Unlock()
 
-	reply.Id = c.nWorkers
-	reply.Nreducer = c.nReduce
-	c.nWorkers++
+	reply.Id = c.nWorker
+	reply.Nreducer = c.nReducer
+	c.nWorker++
 
-	c.mutex.Unlock()
 	return nil
 }
 
-func (c *Coordinator) MapTaskAssign(args *MapGetTaskRequest, reply *MapGetTaskReply) error {
+func (c *Coordinator) MapGetTask(args *MapGetTaskRequest, reply *MapGetTaskReply) error {
 	c.mutex.Lock()
+	defer c.mutex.Unlock()
 
-	if c.curFile == c.nFiles {
+	if c.pendingFiles.Len() == 0 {
 		reply.Filename = ""
 		reply.Done = true
 		for i := 0; i < c.nFiles; i++ {
-			if c.pendingFiles[i] != -1 {
+			if c.FileStatus[i] != -1 {
 				reply.Done = false
 				break
 			}
 		}
 
-		c.mutex.Unlock()
 		return nil
 	}
 
-	reply.Filename = c.files[c.curFile]
+	e := c.pendingFiles.Front()
+	c.pendingFiles.Remove(e)
+
+	file_id := e.Value.(int)
+	reply.Filename = c.files[file_id]
 	reply.Done = false
 
-	c.pendingFiles[c.curFile] = args.Id
-	c.curFile++
+	c.FileStatus[file_id] = args.Id
 
-	c.mutex.Unlock()
 	return nil
 }
 
 func (c *Coordinator) MapTaskDone(args *MapTaskDoneRequest, reply *MapTaskDoneReply) error {
 	c.mutex.Lock()
+	defer c.mutex.Unlock()
 
 	i := 0
 	for ; i < c.nFiles; i++ {
-		if c.pendingFiles[i] == args.Id {
-			c.pendingFiles[i] = -1
+		if c.FileStatus[i] == args.Id {
+			c.FileStatus[i] = -1
 			break
 		}
 	}
@@ -79,7 +85,51 @@ func (c *Coordinator) MapTaskDone(args *MapTaskDoneRequest, reply *MapTaskDoneRe
 		log.Fatalf("MapDone: worker %d not found in pending_files\n", args.Id)
 	}
 
-	c.mutex.Unlock()
+	return nil
+}
+
+func (c *Coordinator) ReduceGetTask(args *ReduceGetTaskRequest, reply *ReduceGetTaskReply) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	reply.Nworker = c.nWorker
+	reply.AllReducerDone = c.nReducerDone == c.nReducer
+	if c.pendingReducers.Len() == 0 {
+		reply.ReducerId = -1
+		return nil
+	}
+
+	e := c.pendingReducers.Front()
+	c.pendingReducers.Remove(e)
+
+	reducer_id := e.Value.(int)
+	c.ReducerStatus[reducer_id] = args.Id
+	reply.ReducerId = reducer_id
+
+	return nil
+}
+
+func (c *Coordinator) ReduceTaskDone(args *ReduceTaskDoneRequest, reply *ReduceTaskDoneReply) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	reducer_id := args.ReducerId
+	if c.ReducerStatus[reducer_id] != args.Id {
+		log.Fatalf("ReduceTaskDone: worker %d not found in ReducerStatus\n", args.Id)
+	}
+
+	c.ReducerStatus[reducer_id] = -1
+	c.nReducerDone++
+
+	return nil
+}
+
+func (c *Coordinator) GraceExit(args *GraceExitRequest, reply *GraceExitReply) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
+	c.nWorkerExit++
+
 	return nil
 }
 
@@ -100,11 +150,10 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 
-	// Your code here.
-
-	return ret
+	return c.nReducerDone == c.nReducer && c.nWorkerExit == c.nWorker
 }
 
 // create a Coordinator.
@@ -112,17 +161,27 @@ func (c *Coordinator) Done() bool {
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		nReduce:      nReduce,
-		files:        files,
-		mutex:        sync.Mutex{},
-		nFiles:       len(files),
-		curFile:      0,
-		pendingFiles: make([]int, len(files)),
-		nWorkers:     0,
+		nReducer:        nReduce,
+		files:           files,
+		mutex:           sync.Mutex{},
+		nFiles:          len(files),
+		pendingFiles:    list.New(),
+		FileStatus:      make([]int, len(files)),
+		pendingReducers: list.New(),
+		ReducerStatus:   make([]int, nReduce),
+		nWorker:         0,
+		nReducerDone:    0,
+		nWorkerExit:     0,
 	}
 
 	for i := 0; i < len(files); i++ {
-		c.pendingFiles[i] = -2
+		c.pendingFiles.PushBack(i)
+		c.FileStatus[i] = -2
+	}
+
+	for i := 0; i < nReduce; i++ {
+		c.pendingReducers.PushBack(i)
+		c.ReducerStatus[i] = -2
 	}
 
 	c.server()
