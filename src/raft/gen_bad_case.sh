@@ -4,7 +4,7 @@ tmpfile=$(mktemp)
 
 for i in $(seq 1 1000); do
     echo "Test $i"
-    go test -run 2A > $tmpfile
+    go test -race -run "2[A|B]" > $tmpfile
     if [ $? -ne 0 ]; then
         cp "$tmpfile" badcase/output.$i
     fi
