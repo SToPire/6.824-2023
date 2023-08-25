@@ -89,9 +89,8 @@ type Raft struct {
 	lastApplied int // index of highest log entry applied to state machine
 
 	// volatile state on leaders
-	nextIndex      []int       // index of the next log entry to send to each server
-	matchIndex     []int       // index of highest log entry known to be replicated on each server
-	lastAppendSent []time.Time // last time this server sent an AppendEntries RPC to each server
+	nextIndex  []int // index of the next log entry to send to each server
+	matchIndex []int // index of highest log entry known to be replicated on each server
 
 	// for leader election
 	votesFrom []bool // whether this server has voted for this server
@@ -488,13 +487,15 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.logBase = args.LastIncludedIndex + 1
 
 	/* tell upper service to install snapshot */
-	msg = ApplyMsg{
-		SnapshotValid: true,
-		Snapshot:      args.Data,
-		SnapshotTerm:  args.LastIncludedTerm,
-		SnapshotIndex: args.LastIncludedIndex,
+	if rf.lastApplied < args.LastIncludedIndex {
+		msg = ApplyMsg{
+			SnapshotValid: true,
+			Snapshot:      args.Data,
+			SnapshotTerm:  args.LastIncludedTerm,
+			SnapshotIndex: args.LastIncludedIndex,
+		}
+		rf.applyBuffer <- msg
 	}
-	rf.applyBuffer <- msg
 
 	needPersist = true
 
@@ -692,13 +693,6 @@ func (rf *Raft) sendNewEntries() {
 				return
 			}
 
-			/* Freq control: Do not send too many AppendEntries RPCs */
-			if time.Since(rf.lastAppendSent[server]) < AppendEntriesInterval {
-				rf.mu.Unlock()
-				return
-			}
-			rf.lastAppendSent[server] = time.Now()
-
 			/* send AppendEntries RPC with log entries starting at nextIndex */
 			prevLogIndex := rf.nextIndex[server] - 1
 			lastLogIndex := rf.getLastLogIndex()
@@ -793,12 +787,10 @@ func (rf *Raft) becomeLeader() {
 	rf.state = RAFT_LEADER
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
-	rf.lastAppendSent = make([]time.Time, len(rf.peers))
 	for i := range rf.peers {
 		rf.nextIndex[i] = rf.logBase + len(rf.log)
 		rf.matchIndex[i] = 0
 		// make sure first AppendEntries will be sent
-		rf.lastAppendSent[i] = time.Now().Add(-AppendEntriesInterval * 2)
 	}
 	rf.commitCV.Signal()
 }
