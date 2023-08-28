@@ -1,12 +1,13 @@
 package kvraft
 
 import (
-	"6.5840/labgob"
-	"6.5840/labrpc"
-	"6.5840/raft"
 	"log"
 	"sync"
 	"sync/atomic"
+
+	"6.5840/labgob"
+	"6.5840/labrpc"
+	"6.5840/raft"
 )
 
 const Debug = false
@@ -18,11 +19,31 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const (
+	GetOp    = 0
+	PutOp    = 1
+	AppendOp = 2
+)
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
+	Type      int
+	Key       string
+	Value     string
+	ClientId  int64
+	RequestId int
+}
+
+// message from apply goroutine to RPC handler
+type ReturnData struct {
+	err       Err
+	Value     string
+	RequestId int
+}
+
+// metadata for each client
+type ClientData struct {
+	RequestId int    // last request ID
+	Value     string // return value of Get
 }
 
 type KVServer struct {
@@ -34,16 +55,166 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
+	kvMap     map[string]string    // store kv pairs
+	clientMap map[int64]ClientData // store last operation for each client
+
+	chanMap map[int64]chan ReturnData // store channel for each client
 }
 
-
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
+	kv.mu.Lock()
+
+	// the request has been served before, fetch the previous result
+	if args.RequestId <= kv.clientMap[args.ClientId].RequestId {
+		reply.Err = OK
+		reply.Value = kv.clientMap[args.ClientId].Value
+		kv.mu.Unlock()
+		return
+	}
+
+	op := Op{
+		Type:      GetOp,
+		Key:       args.Key,
+		RequestId: args.RequestId,
+		ClientId:  args.ClientId,
+	}
+
+	_, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	// prepare channel for this request
+	c := make(chan ReturnData)
+	kv.chanMap[args.ClientId] = c
+
+	kv.mu.Unlock()
+
+	// wait until the request is applied
+	for rdata := range c {
+		// make sure the request is the one we are waiting for
+		if rdata.RequestId == args.RequestId {
+			reply.Err = rdata.err
+			reply.Value = rdata.Value
+			return
+		}
+	}
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
+	kv.mu.Lock()
+
+	// the request has been served before
+	if args.RequestId <= kv.clientMap[args.ClientId].RequestId {
+		reply.Err = OK
+		kv.mu.Unlock()
+		return
+	}
+
+	op := Op{
+		Type:      PutOp,
+		Key:       args.Key,
+		Value:     args.Value,
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+	if args.Op == "Append" {
+		op.Type = AppendOp
+	}
+
+	_, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		kv.mu.Unlock()
+		return
+	}
+
+	// prepare channel for this request
+	c := make(chan ReturnData)
+	kv.chanMap[args.ClientId] = c
+
+	kv.mu.Unlock()
+
+	// wait until the request is applied
+	for rdata := range c {
+		// make sure the request is the one we are waiting for
+		if rdata.RequestId == args.RequestId {
+			reply.Err = OK
+			return
+		}
+	}
+
+}
+
+func (kv *KVServer) applyOp() {
+	for msg := range kv.applyCh {
+		if kv.killed() {
+			return
+		}
+
+		if !msg.CommandValid {
+			continue
+		}
+
+		op := msg.Command.(Op)
+
+		clientId := op.ClientId
+		requestId := op.RequestId
+
+		kv.mu.Lock()
+
+		// A request could be duplicated in log, so we need to check if it has been applied before
+		if kv.clientMap[clientId].RequestId >= requestId {
+			kv.mu.Unlock()
+			continue
+		}
+		DPrintf("[Server %d] apply op %+v", kv.me, op)
+
+		newClientData := ClientData{
+			RequestId: requestId,
+		}
+
+		status := OK
+
+		// update local state machine, including kvMap and clientMap
+		if op.Type == GetOp {
+			var exist bool
+			newClientData.Value, exist = kv.kvMap[op.Key]
+			if !exist {
+				status = ErrNoKey
+			} else {
+				DPrintf("[Server %d] get %s = %s", kv.me, op.Key, newClientData.Value)
+			}
+		} else if op.Type == PutOp {
+			kv.kvMap[op.Key] = op.Value
+		} else if op.Type == AppendOp {
+			kv.kvMap[op.Key] += op.Value
+		} else {
+			panic("invalid op type")
+		}
+
+		kv.clientMap[clientId] = newClientData
+
+		// if some RPC handler is waiting for this request, send the result to it
+		c, ok := kv.chanMap[clientId]
+		if !ok {
+			kv.mu.Unlock()
+			continue
+		}
+
+		// prevent sending to a outdated channel
+		delete(kv.chanMap, clientId)
+		kv.mu.Unlock()
+
+		c <- ReturnData{
+			err:       Err(status),
+			Value:     newClientData.Value,
+			RequestId: requestId,
+		}
+	}
+
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -87,11 +258,15 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.kvMap = make(map[string]string)
+	kv.clientMap = make(map[int64]ClientData)
+	kv.chanMap = make(map[int64]chan ReturnData)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	go kv.applyOp()
 
 	return kv
 }
