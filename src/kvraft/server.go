@@ -1,9 +1,11 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"6.5840/labgob"
 	"6.5840/labrpc"
@@ -54,6 +56,8 @@ type KVServer struct {
 	dead    int32 // set by Kill()
 
 	maxraftstate int // snapshot if log grows this big
+	persister    *raft.Persister
+	lastApplied  int // for snapshot
 
 	kvMap     map[string]string    // store kv pairs
 	clientMap map[int64]ClientData // store last operation for each client
@@ -145,13 +149,20 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			return
 		}
 	}
-
 }
 
 func (kv *KVServer) applyOp() {
 	for msg := range kv.applyCh {
 		if kv.killed() {
 			return
+		}
+
+		/* Underlying raft receives a snapshot from other servers. */
+		if msg.SnapshotValid {
+			kv.mu.Lock()
+			kv.readSnapshot(msg.Snapshot)
+			kv.mu.Unlock()
+			continue
 		}
 
 		if !msg.CommandValid {
@@ -195,6 +206,8 @@ func (kv *KVServer) applyOp() {
 			panic("invalid op type")
 		}
 
+		kv.lastApplied = msg.CommandIndex
+
 		kv.clientMap[clientId] = newClientData
 
 		// if some RPC handler is waiting for this request, send the result to it
@@ -215,6 +228,44 @@ func (kv *KVServer) applyOp() {
 		}
 	}
 
+}
+
+/* background goroutine to take snapshot periodically */
+func (kv *KVServer) takeSnapshot() {
+	for kv.maxraftstate != -1 && !kv.killed() {
+		kv.mu.Lock()
+		/* raft state size is close to the threshold */
+		if kv.persister.RaftStateSize() > kv.maxraftstate/2 {
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(kv.kvMap)
+			e.Encode(kv.clientMap)
+			data := w.Bytes()
+			kv.rf.Snapshot(kv.lastApplied, data)
+		}
+		kv.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (kv *KVServer) readSnapshot(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+
+	var kvMap map[string]string
+	var clientMap map[int64]ClientData
+
+	if d.Decode(&kvMap) != nil ||
+		d.Decode(&clientMap) != nil {
+		panic("failed to read snapshot")
+	} else {
+		kv.kvMap = kvMap
+		kv.clientMap = clientMap
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -256,17 +307,22 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
+	kv.persister = persister
 
 	// You may need initialization code here.
 	kv.kvMap = make(map[string]string)
 	kv.clientMap = make(map[int64]ClientData)
 	kv.chanMap = make(map[int64]chan ReturnData)
 
+	// initialize from state persisted before a crash
+	kv.readSnapshot(kv.persister.ReadSnapshot())
+
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
 	go kv.applyOp()
+	go kv.takeSnapshot()
 
 	return kv
 }
