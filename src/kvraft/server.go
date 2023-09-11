@@ -36,14 +36,14 @@ type Op struct {
 }
 
 // message from apply goroutine to RPC handler
-type ReturnData struct {
+type returnData struct {
 	err       Err
-	Value     string
-	RequestId int
+	value     string
+	requestId int
 }
 
 // metadata for each client
-type ClientData struct {
+type clientData struct {
 	RequestId int    // last request ID
 	Value     string // return value of Get
 }
@@ -60,9 +60,9 @@ type KVServer struct {
 	lastApplied  int // for snapshot
 
 	kvMap     map[string]string    // store kv pairs
-	clientMap map[int64]ClientData // store last operation for each client
+	clientMap map[int64]clientData // store last operation for each client
 
-	chanMap map[int64]chan ReturnData // store channel for each client
+	chanMap map[int64]chan returnData // store channel for each client
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -91,7 +91,7 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 
 	// prepare channel for this request
-	c := make(chan ReturnData)
+	c := make(chan returnData)
 	kv.chanMap[args.ClientId] = c
 
 	kv.mu.Unlock()
@@ -99,9 +99,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// wait until the request is applied
 	for rdata := range c {
 		// make sure the request is the one we are waiting for
-		if rdata.RequestId == args.RequestId {
+		if rdata.requestId == args.RequestId {
 			reply.Err = rdata.err
-			reply.Value = rdata.Value
+			reply.Value = rdata.value
 			return
 		}
 	}
@@ -136,7 +136,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	}
 
 	// prepare channel for this request
-	c := make(chan ReturnData)
+	c := make(chan returnData)
 	kv.chanMap[args.ClientId] = c
 
 	kv.mu.Unlock()
@@ -144,7 +144,7 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// wait until the request is applied
 	for rdata := range c {
 		// make sure the request is the one we are waiting for
-		if rdata.RequestId == args.RequestId {
+		if rdata.requestId == args.RequestId {
 			reply.Err = OK
 			return
 		}
@@ -183,7 +183,7 @@ func (kv *KVServer) applyOp() {
 		}
 		DPrintf("[Server %d] apply op %+v", kv.me, op)
 
-		newClientData := ClientData{
+		newClientData := clientData{
 			RequestId: requestId,
 		}
 
@@ -221,10 +221,10 @@ func (kv *KVServer) applyOp() {
 		delete(kv.chanMap, clientId)
 		kv.mu.Unlock()
 
-		c <- ReturnData{
+		c <- returnData{
 			err:       Err(status),
-			Value:     newClientData.Value,
-			RequestId: requestId,
+			value:     newClientData.Value,
+			requestId: requestId,
 		}
 	}
 
@@ -257,7 +257,7 @@ func (kv *KVServer) readSnapshot(data []byte) {
 	d := labgob.NewDecoder(r)
 
 	var kvMap map[string]string
-	var clientMap map[int64]ClientData
+	var clientMap map[int64]clientData
 
 	if d.Decode(&kvMap) != nil ||
 		d.Decode(&clientMap) != nil {
@@ -311,8 +311,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// You may need initialization code here.
 	kv.kvMap = make(map[string]string)
-	kv.clientMap = make(map[int64]ClientData)
-	kv.chanMap = make(map[int64]chan ReturnData)
+	kv.clientMap = make(map[int64]clientData)
+	kv.chanMap = make(map[int64]chan returnData)
 
 	// initialize from state persisted before a crash
 	kv.readSnapshot(kv.persister.ReadSnapshot())

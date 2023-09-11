@@ -10,7 +10,7 @@ import (
 	"6.5840/raft"
 )
 
-type ClientData struct {
+type clientData struct {
 	RequestId int
 	Config    Config // return value of Query
 }
@@ -29,7 +29,7 @@ type ShardCtrler struct {
 	applyCh chan raft.ApplyMsg
 
 	// Your data here.
-	clientMap map[int64]ClientData      // indexed by client id
+	clientMap map[int64]clientData      // indexed by client id
 	chanMap   map[int64]chan ReturnData // store channel for each client
 
 	configs []Config // indexed by config num
@@ -413,7 +413,7 @@ func (sc *ShardCtrler) apply() {
 			continue
 		}
 
-		newClientData := ClientData{
+		newClientData := clientData{
 			RequestId: requestId,
 		}
 
@@ -490,7 +490,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	// Your code here.
-	sc.clientMap = make(map[int64]ClientData)
+	sc.clientMap = make(map[int64]clientData)
 	sc.chanMap = make(map[int64]chan ReturnData)
 
 	go sc.apply()
